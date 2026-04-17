@@ -62,21 +62,32 @@ from .config import DifficultyConfig
 # Each row is one (x, y) optimal position for that class.
 # ---------------------------------------------------------------------------
 OPTIMAL_STRATEGIES: dict[int, np.ndarray] = {
-    0: np.array([
-        [+0.25, +0.25],   # primary: class 0 separable from class 1
-        [+0.25, -0.25],   # merge:   class 0 looks same as class 3 merge
-    ]),
-    1: np.array([
-        [-0.25, +0.25],   # primary: class 1 separable from class 0
-    ]),
-    2: np.array([
-        [-0.25, -0.25],   # primary: class 2 separable from class 3
-    ]),
-    3: np.array([
-        [-0.20, -0.20],   # primary: class 3 separable from class 2
-        [-0.25, +0.25],   # merge:   class 3 looks same as class 0 merge
-        [+0.20,  0.00],   # alt:     class 3 separable from class 2 (alternate path)
-    ]),
+    0: np.array(
+        [
+            [+0.5, +0.5],  # primary: class 0 separable from class 1
+            # [+0.25, -0.25],   # merge:   class 0 looks same as class 3 merge
+        ]
+    ),
+    1: np.array(
+        [
+            [-0.5, +0.5],  # primary: class 1 separable from class 0
+        ]
+    ),
+    2: np.array(
+        [
+            [-0.5, -0.5],  # primary: class 2 separable from class 3
+        ]
+    ),
+    3: np.array(
+        [
+            # [-0.20, -0.20],  # primary: class 3 separable from class 2
+            [0.5, -0.5],  # merge:   class 3 looks same as class 0 merge
+            # [
+            #     +0.20,
+            #     0.00,
+            # ],  # alt:     class 3 separable from class 2 (alternate path)
+        ]
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -87,46 +98,62 @@ OPTIMAL_STRATEGIES: dict[int, np.ndarray] = {
 _MERGE = np.array([0.0, 0.0, 0.0])
 
 STRATEGY_CENTROIDS: dict[int, np.ndarray] = {
-    0: np.array([
-        [+2.0, +1.5,  0.0],   # class 0 primary
-        _MERGE,                # class 0 merge  ← same as class 3 merge
-    ]),
-    1: np.array([
-        [+2.0, -1.5,  0.0],   # class 1 primary
-    ]),
-    2: np.array([
-        [-2.0,  0.0, +1.5],   # class 2 primary
-    ]),
-    3: np.array([
-        [-2.0,  0.0, -1.5],   # class 3 primary
-        _MERGE,                # class 3 merge  ← same as class 0 merge
-        [-2.0,  0.0, -1.5],   # class 3 alt (same centroid, different strategy position)
-    ]),
+    0: np.array(
+        [
+            [+2.0, +1.5, 0.0],  # class 0 primary
+            _MERGE,  # class 0 merge  ← same as class 3 merge
+        ]
+    ),
+    1: np.array(
+        [
+            [+2.0, -1.5, 0.0],  # class 1 primary
+        ]
+    ),
+    2: np.array(
+        [
+            [-2.0, 0.0, +1.5],  # class 2 primary
+        ]
+    ),
+    3: np.array(
+        [
+            [-2.0, 0.0, -1.5],  # class 3 primary
+            _MERGE,  # class 3 merge  ← same as class 0 merge
+            [
+                -2.0,
+                0.0,
+                -1.5,
+            ],  # class 3 alt (same centroid, different strategy position)
+        ]
+    ),
 }
 
 # Cluster-level centroids — z_class is pulled here when NOT at any optimal.
 # Fine dims are zero so within-cluster classes are indistinguishable.
-CLUSTER_CENTROIDS = np.array([
-    [+2.0, 0.0, 0.0],   # class 0 — cluster A, no fine separation
-    [+2.0, 0.0, 0.0],   # class 1 — cluster A, no fine separation
-    [-2.0, 0.0, 0.0],   # class 2 — cluster B, no fine separation
-    [-2.0, 0.0, 0.0],   # class 3 — cluster B, no fine separation
-])
+CLUSTER_CENTROIDS = np.array(
+    [
+        [+2.0, 0.0, 0.0],  # class 0 — cluster A, no fine separation
+        [+2.0, 0.0, 0.0],  # class 1 — cluster A, no fine separation
+        [-2.0, 0.0, 0.0],  # class 2 — cluster B, no fine separation
+        [-2.0, 0.0, 0.0],  # class 3 — cluster B, no fine separation
+    ]
+)
 
 # Integration time constant: class_scale builds up over ~SCALE_TAU seconds
 SCALE_TAU = 3.0
 
-N_CLASS_DIMS    = 3
+N_CLASS_DIMS = 3
 N_STRATEGY_DIMS = 2
-N_NOISE_DIMS    = 3
-N_LATENT        = N_CLASS_DIMS + N_STRATEGY_DIMS + N_NOISE_DIMS   # 8
+N_NOISE_DIMS = 3
+N_LATENT = N_CLASS_DIMS + N_STRATEGY_DIMS + N_NOISE_DIMS  # 8
 
 
 def _givens(n: int, i: int, j: int, theta: float) -> np.ndarray:
     R = np.eye(n)
     c, s = np.cos(theta), np.sin(theta)
-    R[i, i] =  c;  R[i, j] = -s
-    R[j, i] =  s;  R[j, j] =  c
+    R[i, i] = c
+    R[i, j] = -s
+    R[j, i] = s
+    R[j, j] = c
     return R
 
 
@@ -147,21 +174,28 @@ class LatentDynamics:
     z_full                 — full 8-dim latent vector
     """
 
-    def __init__(self, config: DifficultyConfig, sample_rate: float = 10.0, seed: int = 42):
-        self.cfg         = config
-        self.dt          = 1.0 / sample_rate
-        self.t           = 0.0
+    def __init__(
+        self,
+        config: DifficultyConfig,
+        sample_rate: float = 10.0,
+        seed: int = 42,
+    ):
+        self.cfg = config
+        self.dt = 1.0 / sample_rate
+        self.t = 0.0
 
         rng = np.random.default_rng(seed)
 
-        self.z_class    = np.zeros(N_CLASS_DIMS)
+        self.z_class = np.zeros(N_CLASS_DIMS)
         self.z_strategy = np.zeros(N_STRATEGY_DIMS)
-        self.z_noise    = np.zeros(N_NOISE_DIMS)
+        self.z_noise = np.zeros(N_NOISE_DIMS)
 
         self.current_class: int | None = None
-        self._scale_integrated: float  = 0.0
+        self._scale_integrated: float = 0.0
         self._noise_rng = rng
-        self._nearest_strategy_idx: int = 0   # index into current class's strategy list
+        self._nearest_strategy_idx: int = (
+            0  # index into current class's strategy list
+        )
 
     # ------------------------------------------------------------------
     # Public controls
@@ -173,8 +207,10 @@ class LatentDynamics:
     def update_strategy(self, delta: np.ndarray) -> None:
         """Move z_strategy by delta (arrow keys). Clamped to [-1, 1]²."""
         self.z_strategy = np.clip(
-            self.z_strategy + np.asarray(delta, float) * self.cfg.strategy_speed,
-            -1.0, 1.0,
+            self.z_strategy
+            + np.asarray(delta, float) * self.cfg.strategy_speed,
+            -1.0,
+            1.0,
         )
 
     # ------------------------------------------------------------------
@@ -190,16 +226,18 @@ class LatentDynamics:
         #    to the strategy-specific centroid (including the shared merge centroid).
         if self.current_class is not None:
             cls = self.current_class
-            optima = OPTIMAL_STRATEGIES[cls]                    # (K, 2)
-            dists  = np.linalg.norm(optima - self.z_strategy, axis=1)
+            optima = OPTIMAL_STRATEGIES[cls]  # (K, 2)
+            dists = np.linalg.norm(optima - self.z_strategy, axis=1)
             self._nearest_strategy_idx = int(np.argmin(dists))
             sq = float(np.exp(-2.5 * dists[self._nearest_strategy_idx]))
 
-            cluster_cent  = CLUSTER_CENTROIDS[cls]
+            cluster_cent = CLUSTER_CENTROIDS[cls]
             specific_cent = STRATEGY_CENTROIDS[cls][self._nearest_strategy_idx]
             effective_cent = cluster_cent + sq * (specific_cent - cluster_cent)
 
-            self.z_class += cfg.class_pull_strength * (effective_cent - self.z_class)
+            self.z_class += cfg.class_pull_strength * (
+                effective_cent - self.z_class
+            )
         else:
             self._nearest_strategy_idx = 0
             self.z_class *= 1.0 - cfg.class_pull_strength * 0.4
@@ -209,29 +247,34 @@ class LatentDynamics:
         self.z_strategy = self.z_strategy * decay
 
         # 3. Latent Gaussian noise on z_class
-        self.z_class += self._noise_rng.normal(0, cfg.latent_noise_std, N_CLASS_DIMS)
+        self.z_class += self._noise_rng.normal(
+            0, cfg.latent_noise_std, N_CLASS_DIMS
+        )
 
         # 4. Noise dims: slow AR(1) random walk
-        self.z_noise = (0.85 * self.z_noise
-                        + self._noise_rng.normal(0, 0.25, N_NOISE_DIMS))
+        self.z_noise = 0.85 * self.z_noise + self._noise_rng.normal(
+            0, 0.25, N_NOISE_DIMS
+        )
 
         # 5. Leaky integrator: class_scale rises when strategy quality is high
-        target_scale           = self.strategy_quality ** 3
-        alpha                  = self.dt / SCALE_TAU
-        self._scale_integrated += alpha * (target_scale - self._scale_integrated)
+        target_scale = self.strategy_quality**3
+        alpha = self.dt / SCALE_TAU
+        self._scale_integrated += alpha * (
+            target_scale - self._scale_integrated
+        )
 
         # 6. Advance time
         self.t += self.dt
 
         return {
-            "z_class":              self.z_class.copy(),
-            "z_strategy":           self.z_strategy.copy(),
-            "z_noise":              self.z_noise.copy(),
-            "current_class":        self.current_class,
+            "z_class": self.z_class.copy(),
+            "z_strategy": self.z_strategy.copy(),
+            "z_noise": self.z_noise.copy(),
+            "current_class": self.current_class,
             "nearest_strategy_idx": self._nearest_strategy_idx,
-            "strategy_quality":     self.strategy_quality,
-            "class_scale":          self.class_scale,
-            "t":                    self.t,
+            "strategy_quality": self.strategy_quality,
+            "class_scale": self.class_scale,
+            "t": self.t,
         }
 
     # ------------------------------------------------------------------
@@ -247,13 +290,13 @@ class LatentDynamics:
         error between z_strategy and the nearest optimal for the active class.
         """
         if self.current_class is not None:
-            cls    = self.current_class
+            cls = self.current_class
             target = OPTIMAL_STRATEGIES[cls][self._nearest_strategy_idx]
-            err    = self.z_strategy - target
+            err = self.z_strategy - target
         else:
             err = np.array([1.0, 1.0])
 
-        scale   = self.cfg.strategy_sensitivity
+        scale = self.cfg.strategy_sensitivity
         half_pi = np.pi / 2
 
         theta1 = half_pi * np.tanh(scale * err[0])
@@ -281,7 +324,7 @@ class LatentDynamics:
         if self.current_class is None:
             return 0.0
         optima = OPTIMAL_STRATEGIES[self.current_class]
-        dists  = np.linalg.norm(optima - self.z_strategy, axis=1)
+        dists = np.linalg.norm(optima - self.z_strategy, axis=1)
         return float(np.exp(-2.5 * dists.min()))
 
     @property
@@ -302,5 +345,5 @@ class LatentDynamics:
         if self.current_class is None:
             return np.zeros(2)
         optima = OPTIMAL_STRATEGIES[self.current_class]
-        dists  = np.linalg.norm(optima - self.z_strategy, axis=1)
+        dists = np.linalg.norm(optima - self.z_strategy, axis=1)
         return optima[np.argmin(dists)].copy()

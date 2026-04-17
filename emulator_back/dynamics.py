@@ -50,10 +50,10 @@ from .config import DifficultyConfig
 # ---------------------------------------------------------------------------
 CLASS_CENTROIDS = np.array(
     [
-        [+2.0, +1.5,  0.0],   # 0 — left_hand  (cluster A, fine_A = +)
-        [+2.0, -1.5,  0.0],   # 1 — right_hand (cluster A, fine_A = -)
-        [-2.0,  0.0, +1.5],   # 2 — left_leg   (cluster B, fine_B = +)
-        [-2.0,  0.0, -1.5],   # 3 — right_leg  (cluster B, fine_B = -)
+        [+2.0, +1.5, 0.0],  # 0 — left_hand  (cluster A, fine_A = +)
+        [+2.0, -1.5, 0.0],  # 1 — right_hand (cluster A, fine_A = -)
+        [-2.0, 0.0, +1.5],  # 2 — left_leg   (cluster B, fine_B = +)
+        [-2.0, 0.0, -1.5],  # 3 — right_leg  (cluster B, fine_B = -)
     ],
     dtype=float,
 )
@@ -61,10 +61,10 @@ CLASS_CENTROIDS = np.array(
 # Per-class optimal strategy positions — the four corners of [-1,1]²
 OPTIMAL_STRATEGIES = np.array(
     [
-        [+0.2, +0.2],   # 0 — left_hand
-        [-0.2, +0.2],   # 1 — right_hand
-        [+0.2, -0.2],   # 2 — left_leg
-        [-0.2, -0.2],   # 3 — right_leg
+        [+0.5, +0.5],  # 0 — left_hand
+        [-0.5, +0.5],  # 1 — right_hand
+        [+0.5, -0.5],  # 2 — left_leg
+        [-0.5, -0.5],  # 3 — right_leg
     ],
     dtype=float,
 )
@@ -72,17 +72,19 @@ OPTIMAL_STRATEGIES = np.array(
 # Integration time constant: class_scale builds up over ~SCALE_TAU seconds
 SCALE_TAU = 3.0
 
-N_CLASS_DIMS    = 3   # coarse + fine_A + fine_B
+N_CLASS_DIMS = 3  # coarse + fine_A + fine_B
 N_STRATEGY_DIMS = 2
-N_NOISE_DIMS    = 3
-N_LATENT        = N_CLASS_DIMS + N_STRATEGY_DIMS + N_NOISE_DIMS   # 8
+N_NOISE_DIMS = 3
+N_LATENT = N_CLASS_DIMS + N_STRATEGY_DIMS + N_NOISE_DIMS  # 8
 
 
 def _givens(n: int, i: int, j: int, theta: float) -> np.ndarray:
     R = np.eye(n)
     c, s = np.cos(theta), np.sin(theta)
-    R[i, i] =  c;  R[i, j] = -s
-    R[j, i] =  s;  R[j, j] =  c
+    R[i, i] = c
+    R[i, j] = -s
+    R[j, i] = s
+    R[j, j] = c
     return R
 
 
@@ -102,19 +104,24 @@ class LatentDynamics:
     z_full                 — full 8-dim latent vector
     """
 
-    def __init__(self, config: DifficultyConfig, sample_rate: float = 10.0, seed: int = 42):
-        self.cfg         = config
-        self.dt          = 1.0 / sample_rate
-        self.t           = 0.0
+    def __init__(
+        self,
+        config: DifficultyConfig,
+        sample_rate: float = 10.0,
+        seed: int = 42,
+    ):
+        self.cfg = config
+        self.dt = 1.0 / sample_rate
+        self.t = 0.0
 
         rng = np.random.default_rng(seed)
 
-        self.z_class    = np.zeros(N_CLASS_DIMS)
+        self.z_class = np.zeros(N_CLASS_DIMS)
         self.z_strategy = np.zeros(N_STRATEGY_DIMS)
-        self.z_noise    = np.zeros(N_NOISE_DIMS)
+        self.z_noise = np.zeros(N_NOISE_DIMS)
 
         self.current_class: int | None = None
-        self._scale_integrated: float  = 0.0
+        self._scale_integrated: float = 0.0
         self._noise_rng = rng
 
     # ------------------------------------------------------------------
@@ -127,8 +134,10 @@ class LatentDynamics:
     def update_strategy(self, delta: np.ndarray) -> None:
         """Move z_strategy by delta (arrow keys). Clamped to [-1, 1]²."""
         self.z_strategy = np.clip(
-            self.z_strategy + np.asarray(delta, float) * self.cfg.strategy_speed,
-            -1.0, 1.0,
+            self.z_strategy
+            + np.asarray(delta, float) * self.cfg.strategy_speed,
+            -1.0,
+            1.0,
         )
 
     # ------------------------------------------------------------------
@@ -152,28 +161,33 @@ class LatentDynamics:
             self.z_class *= 1.0 - cfg.class_pull_strength * 0.4
 
         # 3. Latent Gaussian noise on z_class (background neural noise)
-        self.z_class += self._noise_rng.normal(0, cfg.latent_noise_std, N_CLASS_DIMS)
+        self.z_class += self._noise_rng.normal(
+            0, cfg.latent_noise_std, N_CLASS_DIMS
+        )
 
         # 4. Noise dims: slow AR(1) random walk
-        self.z_noise = (0.85 * self.z_noise
-                        + self._noise_rng.normal(0, 0.25, N_NOISE_DIMS))
+        self.z_noise = 0.85 * self.z_noise + self._noise_rng.normal(
+            0, 0.25, N_NOISE_DIMS
+        )
 
         # 5. Leaky integrator: class_scale rises when strategy quality is high
-        target_scale           = self.strategy_quality ** 3
-        alpha                  = self.dt / SCALE_TAU
-        self._scale_integrated += alpha * (target_scale - self._scale_integrated)
+        target_scale = self.strategy_quality**3
+        alpha = self.dt / SCALE_TAU
+        self._scale_integrated += alpha * (
+            target_scale - self._scale_integrated
+        )
 
         # 6. Advance time
         self.t += self.dt
 
         return {
-            "z_class":           self.z_class.copy(),
-            "z_strategy":        self.z_strategy.copy(),
-            "z_noise":           self.z_noise.copy(),
-            "current_class":     self.current_class,
-            "strategy_quality":  self.strategy_quality,
-            "class_scale":       self.class_scale,
-            "t":                 self.t,
+            "z_class": self.z_class.copy(),
+            "z_strategy": self.z_strategy.copy(),
+            "z_noise": self.z_noise.copy(),
+            "current_class": self.current_class,
+            "strategy_quality": self.strategy_quality,
+            "class_scale": self.class_scale,
+            "t": self.t,
         }
 
     # ------------------------------------------------------------------
@@ -198,12 +212,14 @@ class LatentDynamics:
             # No active class: maximum rotation (fine dims fully scrambled)
             err = np.array([1.0, 1.0])
 
-        scale   = self.cfg.strategy_sensitivity
+        scale = self.cfg.strategy_sensitivity
         half_pi = np.pi / 2
 
-        theta1 = half_pi * np.tanh(scale * err[0])              # fine_A (1) ↔ noise (5)
-        theta2 = half_pi * np.tanh(scale * err[1])              # fine_B (2) ↔ noise (6)
-        theta3 = half_pi * np.tanh(scale * (err[0] + err[1]) / 2)  # cross-mix (1) ↔ (7)
+        theta1 = half_pi * np.tanh(scale * err[0])  # fine_A (1) ↔ noise (5)
+        theta2 = half_pi * np.tanh(scale * err[1])  # fine_B (2) ↔ noise (6)
+        theta3 = half_pi * np.tanh(
+            scale * (err[0] + err[1]) / 2
+        )  # cross-mix (1) ↔ (7)
 
         R = (
             _givens(N_LATENT, 1, 5, theta1)
@@ -225,7 +241,9 @@ class LatentDynamics:
         """1.0 at the active class's optimal corner, 0 when no class active."""
         if self.current_class is None:
             return 0.0
-        error = np.linalg.norm(self.z_strategy - OPTIMAL_STRATEGIES[self.current_class])
+        error = np.linalg.norm(
+            self.z_strategy - OPTIMAL_STRATEGIES[self.current_class]
+        )
         return float(np.exp(-2.5 * error))
 
     @property

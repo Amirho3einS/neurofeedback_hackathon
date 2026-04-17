@@ -6,7 +6,9 @@ Connects to the emulator via ZMQ and shows:
                 Points fade out with age so you can follow the trajectory.
                 Projection axes are recomputed every few seconds and
                 sign-aligned with the previous axes so the plot stays stable.
-  Right panel — Raw signal (first 8 channels) scrolling over time.
+  Right panel — Class prediction over time: each projected point is compared
+                to class centroids (same markers as the left plot); probabilities
+                are softmax(logits) with logits = −‖x − μ_c‖² so nearer classes win.
 
 Run the emulator first:
     python -m emulator -d easy
@@ -16,21 +18,19 @@ Then in a separate terminal:
 """
 
 import json
+import os
 import threading
 import collections
 import time
+from pathlib import Path
 
+import matplotlib
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.lines import Line2D
 from matplotlib.widgets import Button, Slider
 import zmq
-
-try:
-    from sklearn.ensemble import RandomForestClassifier
-except Exception:  # pragma: no cover - optional dependency
-    RandomForestClassifier = None
 
 # ---------------------------------------------------------------------------
 # Config
@@ -46,14 +46,11 @@ CENTROID_HISTORY_LEN = (
 )
 CENTROID_HISTORY_MAX = 600  # hard cap for stored class history (~60 s @ 10 Hz)
 PHASE2_AVG_N = 5  # representative point: average of last N samples per class
-RAW_DISPLAY_LEN = 100  # samples shown on raw signal panel
+PRED_DISPLAY_LEN = 100  # samples shown on class-prediction panel
 TRAIL_LEN = 40  # length of the bright trajectory line
 REPROJECT_EVERY = 10  # recompute projection every N new samples (~1 s)
 UPDATE_MS = 150  # plot refresh interval in ms
 MIN_PER_CLASS = 8  # need at least this many samples per class before LDA
-KLDA_GAMMA = 0.08  # RBF gamma for KLDA-like mapping
-KLDA_DIM = 24  # kernel feature dimension before LDA
-RF_TREES = 120
 
 CLASS_COLORS = {
     0: "#6495ed",  # cornflower blue  — left_hand
@@ -98,17 +95,23 @@ _phase2_frozen_proj = None
 _phase2_pending_freeze = False
 _phase2_refit_requested = False
 _phase2_data: list[dict] = []
-_mode_order = ["lda", "pca", "qda", "klda", "rf"]
+# Last linear projection matching centroid_project (for export); cleared when no affine proj.
+_last_proj_mean: np.ndarray | None = None
+_last_proj_W: np.ndarray | None = None
+_export_centroids: dict[int, np.ndarray] = {}
+_export_method: str = ""
 
 
-def _mode_label(mode: str) -> str:
-    return {
-        "lda": "LDA",
-        "pca": "PCA",
-        "qda": "QDA",
-        "klda": "KLDA",
-        "rf": "RF",
-    }.get(mode, mode.upper())
+def _record_proj(mean: np.ndarray, W: np.ndarray) -> None:
+    global _last_proj_mean, _last_proj_W
+    _last_proj_mean = np.asarray(mean, dtype=float).copy()
+    _last_proj_W = np.asarray(W, dtype=float).copy()
+
+
+def _clear_proj_record() -> None:
+    global _last_proj_mean, _last_proj_W
+    _last_proj_mean = None
+    _last_proj_W = None
 
 
 def _receiver_thread():
@@ -298,6 +301,44 @@ _proj = LDAProjection()
 # ---------------------------------------------------------------------------
 
 
+def softmax_from_centroid_distances(
+    points: np.ndarray, centroids: dict[int, np.ndarray]
+) -> np.ndarray:
+    """
+    points: (T, 2) projected coordinates
+    centroids: class_idx -> (2,) mean in the same 2D space
+    Returns (T, 4) row-wise softmax over classes 0..3.
+    Logits are negative squared Euclidean distance (missing centroids → −∞).
+    """
+    T = len(points)
+    out = np.zeros((T, 4), dtype=float)
+    if T == 0:
+        return out
+
+    centers = np.full((4, 2), np.nan, dtype=float)
+    have = np.zeros(4, dtype=bool)
+    for c in range(4):
+        if c in centroids:
+            centers[c] = centroids[c]
+            have[c] = True
+
+    if not have.any():
+        out[:, :] = 0.25
+        return out
+
+    d2 = np.full((T, 4), np.inf, dtype=float)
+    for c in range(4):
+        if not have[c]:
+            continue
+        diff = points[:, :] - centers[c]
+        d2[:, c] = np.sum(diff * diff, axis=1)
+
+    logits = np.where(have, -d2, -1e9)
+    logits = logits - logits.max(axis=1, keepdims=True)
+    ex = np.exp(logits)
+    return ex / (ex.sum(axis=1, keepdims=True) + 1e-12)
+
+
 def fisher_score(X2: np.ndarray, labels: np.ndarray) -> float:
     classes = [c for c in np.unique(labels) if c >= 0]
     if len(classes) < 2:
@@ -315,203 +356,28 @@ def fisher_score(X2: np.ndarray, labels: np.ndarray) -> float:
     return float(between / (within + 1e-9))
 
 
-def _build_pca_projection(X_fit: np.ndarray):
-    mean = X_fit.mean(axis=0)
-    _, _, Vt = np.linalg.svd(X_fit - mean, full_matrices=False)
-    pcs = Vt[:2]
-    proj = lambda X, p=pcs, m=mean: (X - m) @ p.T
-    return proj, "PCA"
-
-
-def _build_lda_projection(X_fit: np.ndarray, y_fit: np.ndarray):
-    classes = np.unique(y_fit)
-    usable = [
-        c for c in classes if (y_fit == c).sum() >= MIN_PER_CLASS and c >= 0
-    ]
-    if len(usable) < 2:
-        proj, _ = _build_pca_projection(X_fit)
-        return proj, "PCA (LDA warmup)"
-
-    idx = np.isin(y_fit, usable)
-    X = X_fit[idx]
-    y = y_fit[idx]
-    mean = X.mean(axis=0)
-    Xc = X - mean
-    try:
-        comp = LDAProjection._lda_components(Xc, y)
-        proj = lambda X, c=comp, m=mean: (X - m) @ c.T
-        return proj, "LDA"
-    except Exception:
-        proj, _ = _build_pca_projection(X_fit)
-        return proj, "PCA (LDA fallback)"
-
-
-def _qda_log_posteriors(
-    X: np.ndarray,
-    means: dict[int, np.ndarray],
-    inv_covs: dict[int, np.ndarray],
-    logdets: dict[int, float],
-    priors: dict[int, float],
-    classes: list[int],
-) -> np.ndarray:
-    out = np.zeros((len(X), len(classes)))
-    for j, c in enumerate(classes):
-        d = X - means[c]
-        quad = np.einsum("ij,jk,ik->i", d, inv_covs[c], d)
-        out[:, j] = -0.5 * quad - 0.5 * logdets[c] + np.log(priors[c] + 1e-12)
-    return out
-
-
-def _build_qda_projection(X_fit: np.ndarray, y_fit: np.ndarray):
-    classes = [int(c) for c in np.unique(y_fit) if c >= 0]
-    usable = [c for c in classes if (y_fit == c).sum() >= 3]
-    if len(usable) < 2:
-        proj, _ = _build_pca_projection(X_fit)
-        return proj, "PCA (QDA warmup)"
-
-    means: dict[int, np.ndarray] = {}
-    inv_covs: dict[int, np.ndarray] = {}
-    logdets: dict[int, float] = {}
-    priors: dict[int, float] = {}
-    total = sum((y_fit == c).sum() for c in usable)
-    n_dims = X_fit.shape[1]
-    for c in usable:
-        Xc = X_fit[y_fit == c]
-        means[c] = Xc.mean(axis=0)
-        cov = np.cov(Xc - means[c], rowvar=False) + np.eye(n_dims) * 1e-4
-        sign, logdet = np.linalg.slogdet(cov)
-        if sign <= 0:
-            cov += np.eye(n_dims) * 1e-3
-            sign, logdet = np.linalg.slogdet(cov)
-        inv_covs[c] = np.linalg.pinv(cov)
-        logdets[c] = float(logdet)
-        priors[c] = float((y_fit == c).sum() / max(total, 1))
-
-    F_fit = _qda_log_posteriors(
-        X_fit, means, inv_covs, logdets, priors, usable
-    )
-    fmean = F_fit.mean(axis=0)
-    _, _, Vt = np.linalg.svd(F_fit - fmean, full_matrices=False)
-    pcs = Vt[:2]
-
-    def proj(X):
-        F = _qda_log_posteriors(X, means, inv_covs, logdets, priors, usable)
-        return (F - fmean) @ pcs.T
-
-    return proj, "QDA"
-
-
-def _rbf_kernel(X: np.ndarray, Y: np.ndarray, gamma: float):
-    Xn = np.sum(X * X, axis=1, keepdims=True)
-    Yn = np.sum(Y * Y, axis=1, keepdims=True).T
-    d2 = np.maximum(Xn + Yn - 2 * (X @ Y.T), 0.0)
-    return np.exp(-gamma * d2)
-
-
-def _build_klda_projection(X_fit: np.ndarray, y_fit: np.ndarray):
-    classes = [
-        int(c)
-        for c in np.unique(y_fit)
-        if c >= 0 and (y_fit == c).sum() >= MIN_PER_CLASS
-    ]
-    if len(classes) < 2 or len(X_fit) < 4:
-        proj, _ = _build_pca_projection(X_fit)
-        return proj, "PCA (KLDA warmup)"
-
-    X_ref = X_fit.copy()
-    K = _rbf_kernel(X_ref, X_ref, KLDA_GAMMA)
-    K_mean_rows = K.mean(axis=1, keepdims=True)
-    K_mean_cols = K.mean(axis=0, keepdims=True)
-    K_mean_all = K.mean()
-    Kc = K - K_mean_rows - K_mean_cols + K_mean_all
-
-    evals, evecs = np.linalg.eigh(Kc)
-    idx = np.argsort(evals)[::-1]
-    evals = evals[idx]
-    evecs = evecs[:, idx]
-    keep = min(KLDA_DIM, np.sum(evals > 1e-8))
-    if keep < 2:
-        proj, _ = _build_pca_projection(X_fit)
-        return proj, "PCA (KLDA fallback)"
-
-    lam = evals[:keep]
-    U = evecs[:, :keep] / np.sqrt(lam + 1e-12)
-    Z_fit = Kc @ U
-
-    zproj, zname = _build_lda_projection(Z_fit, y_fit)
-
-    def proj(X):
-        Kx = _rbf_kernel(X, X_ref, KLDA_GAMMA)
-        Kx_row_mean = Kx.mean(axis=1, keepdims=True)
-        Kx_c = Kx - Kx_row_mean - K_mean_cols + K_mean_all
-        Zx = Kx_c @ U
-        return zproj(Zx)
-
-    return proj, f"KLDA ({zname})"
-
-
-def _build_rf_projection(X_fit: np.ndarray, y_fit: np.ndarray):
-    if RandomForestClassifier is None:
-        proj, _ = _build_pca_projection(X_fit)
-        return proj, "PCA (RF unavailable)"
-
-    mask = y_fit >= 0
-    if mask.sum() < 12 or len(np.unique(y_fit[mask])) < 2:
-        proj, _ = _build_pca_projection(X_fit)
-        return proj, "PCA (RF warmup)"
-
-    rf = RandomForestClassifier(
-        n_estimators=RF_TREES,
-        max_depth=9,
-        min_samples_leaf=2,
-        random_state=7,
-        n_jobs=1,
-    )
-    rf.fit(X_fit[mask], y_fit[mask])
-
-    P_fit = rf.predict_proba(X_fit)
-    pmean = P_fit.mean(axis=0)
-    _, _, Vt = np.linalg.svd(P_fit - pmean, full_matrices=False)
-    pcs = Vt[:2]
-
-    def proj(X):
-        P = rf.predict_proba(X)
-        return (P - pmean) @ pcs.T
-
-    return proj, "RF"
-
-
-def _build_projection(mode: str, X_fit: np.ndarray, y_fit: np.ndarray):
-    if len(X_fit) < 2:
-        return (lambda X: np.zeros((len(X), 2))), "waiting"
-    if mode == "pca":
-        return _build_pca_projection(X_fit)
-    if mode == "lda":
-        return _build_lda_projection(X_fit, y_fit)
-    if mode == "qda":
-        return _build_qda_projection(X_fit, y_fit)
-    if mode == "klda":
-        return _build_klda_projection(X_fit, y_fit)
-    if mode == "rf":
-        return _build_rf_projection(X_fit, y_fit)
-    return _build_pca_projection(X_fit)
-
-
 # ---------------------------------------------------------------------------
 # Plot setup
 # ---------------------------------------------------------------------------
 
-fig, ax_proj = plt.subplots(1, 1, figsize=(10, 7))
+fig, (ax_proj, ax_raw) = plt.subplots(1, 2, figsize=(14, 6))
 fig.patch.set_facecolor("#0e0e1a")
 
-ax_proj.set_facecolor("#141422")
-ax_proj.tick_params(colors="#888", labelsize=9)
-for sp in ax_proj.spines.values():
-    sp.set_edgecolor("#333355")
+for ax in (ax_proj, ax_raw):
+    ax.set_facecolor("#141422")
+    ax.tick_params(colors="#888", labelsize=9)
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#333355")
 
 ax_proj.set_title("PCA projection", color="#aaa", fontsize=11)
 ax_proj.set_xlabel("PC 1", color="#777", fontsize=9)
 ax_proj.set_ylabel("PC 2", color="#777", fontsize=9)
+
+ax_raw.set_title(
+    "Class prediction (softmax of −dist² to centroids)", color="#aaa", fontsize=11
+)
+ax_raw.set_xlabel("sample index", color="#777", fontsize=9)
+ax_raw.set_ylabel("probability", color="#777", fontsize=9)
 
 legend_handles = [
     Line2D(
@@ -588,13 +454,23 @@ ax_proj.legend(
     fontsize=8,
 )
 
-fig.tight_layout(pad=2.5, rect=[0, 0.18, 1, 1])
+# tight_layout runs once after all control axes exist (see below). Do not call
+# tight_layout inside the animation loop — it breaks Button hit-testing.
 
 # ---------------------------------------------------------------------------
-# Projection mode buttons
+# PCA / LDA toggle button
 # ---------------------------------------------------------------------------
 
-ax_btn = fig.add_axes([0.02, 0.01, 0.12, 0.055])
+ax_btn_save = fig.add_axes([0.02, 0.01, 0.10, 0.055])
+ax_btn_save.set_facecolor("#1e1e2e")
+_btn_save = Button(
+    ax_btn_save, "Save model", color="#1e1e2e", hovercolor="#2e2e4e"
+)
+_btn_save.label.set_color("#cccccc")
+_btn_save.label.set_fontsize(10)
+_btn_save.label.set_fontweight("bold")
+
+ax_btn = fig.add_axes([0.13, 0.01, 0.12, 0.055])
 ax_btn.set_facecolor("#1e1e2e")
 _btn_toggle = Button(
     ax_btn, "Mode: LDA", color="#1e1e2e", hovercolor="#2e2e4e"
@@ -606,42 +482,21 @@ _btn_toggle.label.set_fontweight("bold")
 
 def _on_btn_click(_event):
     global _proj_mode
-    i = _mode_order.index(_proj_mode) if _proj_mode in _mode_order else 0
-    _proj_mode = _mode_order[(i + 1) % len(_mode_order)]
-    _btn_toggle.label.set_text(f"Mode: {_mode_label(_proj_mode)}")
-    print(f"Projection: {_mode_label(_proj_mode)}")
+    if _proj_mode == "lda":
+        _proj_mode = "pca"
+        _btn_toggle.label.set_text("Mode: PCA")
+        print("Projection: PCA")
+    else:
+        _proj_mode = "lda"
+        _btn_toggle.label.set_text("Mode: LDA")
+        print("Projection: LDA")
     fig.canvas.draw_idle()
 
 
 _btn_toggle.on_clicked(_on_btn_click)
 
-
-def _set_proj_mode(mode: str):
-    global _proj_mode
-    _proj_mode = mode
-    _btn_toggle.label.set_text(f"Mode: {_mode_label(_proj_mode)}")
-    print(f"Projection: {_mode_label(_proj_mode)}")
-    fig.canvas.draw_idle()
-
-
-_mode_buttons = [
-    ("LDA", "lda", [0.15, 0.01, 0.08, 0.055]),
-    ("PCA", "pca", [0.24, 0.01, 0.08, 0.055]),
-    ("QDA", "qda", [0.33, 0.01, 0.08, 0.055]),
-    ("KLDA", "klda", [0.42, 0.01, 0.08, 0.055]),
-    ("RF", "rf", [0.51, 0.01, 0.08, 0.055]),
-]
-for label, mode, pos in _mode_buttons:
-    axm = fig.add_axes(pos)
-    axm.set_facecolor("#1e1e2e")
-    b = Button(axm, label, color="#1e1e2e", hovercolor="#2e2e4e")
-    b.label.set_color("#cccccc")
-    b.label.set_fontsize(9)
-    b.label.set_fontweight("bold")
-    b.on_clicked(lambda _evt, m=mode: _set_proj_mode(m))
-
 # Show last-points overlay toggle button
-ax_btn_hist = fig.add_axes([0.61, 0.01, 0.12, 0.055])
+ax_btn_hist = fig.add_axes([0.26, 0.01, 0.14, 0.055])
 ax_btn_hist.set_facecolor("#1e1e2e")
 _btn_hist = Button(
     ax_btn_hist, "LastPts: OFF", color="#1e1e2e", hovercolor="#2e2e4e"
@@ -661,7 +516,7 @@ def _on_hist_btn_click(_event):
 _btn_hist.on_clicked(_on_hist_btn_click)
 
 # Phase 2 toggle button
-ax_btn_phase2 = fig.add_axes([0.74, 0.01, 0.14, 0.055])
+ax_btn_phase2 = fig.add_axes([0.41, 0.01, 0.15, 0.055])
 ax_btn_phase2.set_facecolor("#1e1e2e")
 _btn_phase2 = Button(
     ax_btn_phase2, "Phase 2: OFF", color="#1e1e2e", hovercolor="#2e2e4e"
@@ -697,7 +552,7 @@ def _on_phase2_btn_click(_event):
 _btn_phase2.on_clicked(_on_phase2_btn_click)
 
 # Phase 2 projection refit button (uses all data gathered since Phase 2 ON)
-ax_btn_phase2_refit = fig.add_axes([0.89, 0.01, 0.10, 0.055])
+ax_btn_phase2_refit = fig.add_axes([0.57, 0.01, 0.08, 0.055])
 ax_btn_phase2_refit.set_facecolor("#1e1e2e")
 _btn_phase2_refit = Button(
     ax_btn_phase2_refit, "P2 Refit", color="#1e1e2e", hovercolor="#2e2e4e"
@@ -719,6 +574,130 @@ def _on_phase2_refit_click(_event):
 
 
 _btn_phase2_refit.on_clicked(_on_phase2_refit_click)
+
+
+def _default_save_path() -> str:
+    """Unique path under cwd (works with macosx/Qt backends; no Tk dialog)."""
+    return str(
+        Path.cwd()
+        / f"classic_brain_model_{int(time.time() * 1000) % 1_000_000_000}.npz"
+    )
+
+
+def _pick_save_path_interactive() -> str:
+    """Tk file dialog; only reliable when Matplotlib uses the TkAgg backend."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+    root.lift()
+    root.update_idletasks()
+    root.update()
+    path = filedialog.asksaveasfilename(
+        parent=root,
+        title="Save classic model",
+        defaultextension=".npz",
+        filetypes=[("NumPy archive", "*.npz"), ("All files", "*.*")],
+        initialfile="classic_brain_model.npz",
+    )
+    root.destroy()
+    return path if isinstance(path, str) else ""
+
+
+def _on_save_btn_click(_event):
+    import traceback
+
+    print("[save] clicked", flush=True)
+    if _last_proj_mean is None or _last_proj_W is None:
+        print(
+            "Save model: no affine projection yet (need LDA/PCA with fit data, "
+            "or Phase 2 freeze/refit).",
+            flush=True,
+        )
+        return
+    if not _export_centroids:
+        print(
+            "Save model: no class centroids yet — collect labeled samples first.",
+            flush=True,
+        )
+        return
+
+    path = ""
+    env_path = os.environ.get("CLASSIC_MODEL_SAVE_PATH", "").strip()
+    if env_path:
+        path = env_path
+    else:
+        backend = matplotlib.get_backend().lower()
+        want_dialog = os.environ.get("CLASSIC_MODEL_SAVE_DIALOG", "").strip() in (
+            "1",
+            "true",
+            "yes",
+        )
+        # macosx / qt backends: a second Tk root often blocks or shows no dialog.
+        use_tk_dialog = want_dialog or (backend == "tkagg")
+        if use_tk_dialog:
+            try:
+                path = _pick_save_path_interactive()
+            except Exception as exc:
+                print(
+                    f"Save model: file dialog failed ({exc}); using cwd.",
+                    flush=True,
+                )
+                traceback.print_exc()
+                path = _default_save_path()
+        else:
+            path = _default_save_path()
+            print(
+                f"[save] backend={backend!r}: writing to {path} "
+                "(set CLASSIC_MODEL_SAVE_PATH to choose a path, or "
+                "CLASSIC_MODEL_SAVE_DIALOG=1 to try Tk picker on non-Tk backends)",
+                flush=True,
+            )
+
+    if not path:
+        print("Save model cancelled.", flush=True)
+        return
+
+    C = np.full((4, 2), np.nan, dtype=float)
+    for c in range(4):
+        if c in _export_centroids:
+            C[c] = _export_centroids[c]
+
+    meta = json.dumps(
+        {
+            "version": 1,
+            "method": _export_method,
+            "class_names": [CLASS_NAMES[i] for i in range(4)],
+        }
+    ).encode("utf-8")
+
+    try:
+        np.savez_compressed(
+            path,
+            mean=_last_proj_mean,
+            W=_last_proj_W,
+            centroids=C,
+            meta_json=np.frombuffer(meta, dtype=np.uint8),
+        )
+    except Exception:
+        print("Save model: writing file failed:")
+        traceback.print_exc()
+        return
+    print(f"Saved classic model to {Path(path).resolve()}", flush=True)
+    try:
+        fig.canvas.manager.set_window_title(
+            f"Saved model → {Path(path).name}"
+        )
+    except Exception:
+        pass
+
+
+_btn_save.on_clicked(_on_save_btn_click)
 
 # Slider: live control of centroid history length (forgetting)
 ax_hist_slider = fig.add_axes([0.15, 0.075, 0.70, 0.03])
@@ -743,8 +722,21 @@ def _on_cent_hist_change(val):
 
 _slider_cent_hist.on_changed(_on_cent_hist_change)
 
+# Manual margins: tight_layout fights extra axes and breaks widgets on some backends.
+for _ctl_ax in (
+    ax_btn_save,
+    ax_btn,
+    ax_btn_hist,
+    ax_btn_phase2,
+    ax_btn_phase2_refit,
+    ax_hist_slider,
+):
+    _ctl_ax.set_in_layout(False)
+fig.subplots_adjust(left=0.07, right=0.99, top=0.92, bottom=0.22, wspace=0.14)
+fig.canvas.draw_idle()
+
 # ---------------------------------------------------------------------------
-# Key handler — shortcuts still available
+# Key handler — L = LDA, P = PCA
 # ---------------------------------------------------------------------------
 
 
@@ -753,18 +745,13 @@ def _on_key(event):
     global _phase2_active, _phase2_frozen_centroids, _phase2_frozen_proj, _phase2_pending_freeze
     global _phase2_refit_requested, _phase2_data
     if event.key in ("l", "L"):
-        _set_proj_mode("lda")
+        _proj_mode = "lda"
+        _btn_toggle.label.set_text("Mode: LDA")
+        print("Projection: LDA")
     elif event.key in ("p", "P"):
-        _set_proj_mode("pca")
-    elif event.key in ("q", "Q"):
-        _set_proj_mode("qda")
-    elif event.key in ("k", "K"):
-        _set_proj_mode("klda")
-    elif event.key in ("f", "F"):
-        _set_proj_mode("rf")
-    elif event.key in ("m", "M"):
-        i = _mode_order.index(_proj_mode) if _proj_mode in _mode_order else 0
-        _set_proj_mode(_mode_order[(i + 1) % len(_mode_order)])
+        _proj_mode = "pca"
+        _btn_toggle.label.set_text("Mode: PCA")
+        print("Projection: PCA")
     elif event.key in ("h", "H"):
         _show_last_hist = not _show_last_hist
         _btn_hist.label.set_text(
@@ -797,6 +784,8 @@ def _on_key(event):
             print(
                 "Phase 2 refit requested: recomputing frozen projection from collected phase-2 data"
             )
+    elif event.key in ("s", "S"):
+        _on_save_btn_click(None)
 
 
 fig.canvas.mpl_connect("key_press_event", _on_key)
@@ -817,6 +806,7 @@ def update(_frame):
 
 def _update_inner():
     global _phase2_pending_freeze, _phase2_frozen_centroids, _phase2_frozen_proj, _phase2_refit_requested
+    global _export_centroids, _export_method
     with _lock:
         if len(_buffer) < 2:
             return
@@ -832,20 +822,147 @@ def _update_inner():
     idxs = np.array([s["idx"] for s in snapshot])
     N = len(snapshot)
 
-    # Project: selectable methods (LDA/PCA/QDA/KLDA/RF), with Phase-2 freeze support.
+    # Project: LDA mode uses per-class fit buffers; PCA mode uses recent history.
+    # Keep the active projection transform so centroid buffers can use the exact same 2D space.
     centroid_project = None
     if _phase2_active and _phase2_frozen_proj is not None:
         coords = _phase2_frozen_proj(data)
         centroid_project = _phase2_frozen_proj
+    elif _proj_mode == "lda":
+        coords = _proj.update(fit_buf_snap, data)
+        if _proj.components is not None and _proj._mean is not None:
+            comp = _proj.components.copy()
+            mean = _proj._mean.copy()
+            centroid_project = lambda X, c=comp, m=mean: (X - m) @ c.T
+            _record_proj(mean, comp)
     else:
-        n_fit = min(140, N)
-        fit_data = data[-n_fit:]
-        fit_labels = labels[-n_fit:]
-        centroid_project, method_name = _build_projection(
-            _proj_mode, fit_data, fit_labels
+        # Plain PCA — recompute on the most recent 100 samples
+        n_fit = min(100, N)
+        mean = data[-n_fit:].mean(axis=0)
+        _, _, Vt = np.linalg.svd(data[-n_fit:] - mean, full_matrices=False)
+        coords = (data - mean) @ Vt[:2].T
+        _proj.method = "PCA"
+        pc = Vt[:2].copy()
+        pm = mean.copy()
+        centroid_project = lambda X, p=pc, m=pm: (X - m) @ p.T
+        _record_proj(pm, pc)
+
+    if centroid_project is None:
+        _clear_proj_record()
+
+    # Centroids + Phase 2 refit before drawing so left/right panels match.
+    live_centroids: dict[int, np.ndarray] = {}
+    for cls in range(4):
+        cbuf = centroid_buf_snap.get(cls, [])
+        if len(cbuf) == 0:
+            continue
+        hist_len = max(1, _centroid_hist_len)
+        Xc = np.array([e["data"] for e in cbuf[-hist_len:]], dtype=float)
+        if centroid_project is not None:
+            ccoords = centroid_project(Xc)
+        else:
+            mask = labels == cls
+            if not mask.any():
+                continue
+            ccoords = coords[mask]
+        live_centroids[cls] = ccoords.mean(axis=0)
+
+    if (
+        _phase2_active
+        and _phase2_pending_freeze
+        and centroid_project is not None
+    ):
+        _phase2_frozen_proj = centroid_project
+        _phase2_frozen_centroids = {
+            cls: pos.copy() for cls, pos in live_centroids.items()
+        }
+        _phase2_pending_freeze = False
+
+    if (
+        _phase2_active
+        and _phase2_refit_requested
+        and len(phase2_data_snap) >= 2
+    ):
+        X_all = np.array([e["data"] for e in phase2_data_snap], dtype=float)
+        y_all = np.array(
+            [
+                e["label"] if e["label"] is not None else -1
+                for e in phase2_data_snap
+            ],
+            dtype=int,
         )
-        coords = centroid_project(data)
-        _proj.method = method_name
+        new_proj = None
+
+        if _proj_mode == "lda":
+            fit_data = []
+            fit_labels = []
+            for cls in range(4):
+                cls_mask = y_all == cls
+                if cls_mask.sum() >= MIN_PER_CLASS:
+                    fit_data.append(X_all[cls_mask])
+                    fit_labels.extend([cls] * int(cls_mask.sum()))
+            if len(fit_data) >= 2:
+                X_fit = np.vstack(fit_data)
+                y_fit = np.array(fit_labels)
+                fit_mean = X_fit.mean(axis=0)
+                X_fit_c = X_fit - fit_mean
+                try:
+                    comp = LDAProjection._lda_components(X_fit_c, y_fit)
+                    new_proj = lambda X, c=comp, m=fit_mean: (X - m) @ c.T
+                    _proj.method = "LDA (P2 frozen)"
+                    _record_proj(fit_mean, comp)
+                except Exception:
+                    _, _, Vt = np.linalg.svd(
+                        X_all - X_all.mean(axis=0), full_matrices=False
+                    )
+                    pmean = X_all.mean(axis=0)
+                    pcs = Vt[:2]
+                    new_proj = lambda X, p=pcs, m=pmean: (X - m) @ p.T
+                    _proj.method = "PCA (P2 fallback)"
+                    _record_proj(pmean, pcs)
+            else:
+                _, _, Vt = np.linalg.svd(
+                    X_all - X_all.mean(axis=0), full_matrices=False
+                )
+                pmean = X_all.mean(axis=0)
+                pcs = Vt[:2]
+                new_proj = lambda X, p=pcs, m=pmean: (X - m) @ p.T
+                _proj.method = "PCA (P2 warmup)"
+                _record_proj(pmean, pcs)
+        else:
+            pmean = X_all.mean(axis=0)
+            _, _, Vt = np.linalg.svd(X_all - pmean, full_matrices=False)
+            pcs = Vt[:2]
+            new_proj = lambda X, p=pcs, m=pmean: (X - m) @ p.T
+            _proj.method = "PCA (P2 frozen)"
+            _record_proj(pmean, pcs)
+
+        if new_proj is not None:
+            _phase2_frozen_proj = new_proj
+            frozen_centroids: dict[int, np.ndarray] = {}
+            for cls in range(4):
+                cls_mask = y_all == cls
+                if cls_mask.any():
+                    ccoords = _phase2_frozen_proj(X_all[cls_mask])
+                    frozen_centroids[cls] = ccoords.mean(axis=0)
+            _phase2_frozen_centroids = frozen_centroids
+            centroid_project = _phase2_frozen_proj
+            coords = _phase2_frozen_proj(data)
+            print(
+                f"Phase 2 refit applied using {len(phase2_data_snap)} gathered samples"
+            )
+
+        _phase2_refit_requested = False
+
+    if _phase2_active and _phase2_frozen_centroids:
+        centroids_for_pred = _phase2_frozen_centroids
+    else:
+        centroids_for_pred = live_centroids
+
+    _export_centroids = {
+        c: pos.copy() for c, pos in centroids_for_pred.items()
+    }
+    _export_method = _proj.method
 
     # ----------------------------------------------------------------
     # Left: stable PCA scatter with fade trail
@@ -924,69 +1041,6 @@ def _update_inner():
                 zorder=5,
             )
 
-    live_centroids: dict[int, np.ndarray] = {}
-    # Large centroid circles: mean projected location per class over recent history.
-    for cls in range(4):
-        cbuf = centroid_buf_snap.get(cls, [])
-        if len(cbuf) == 0:
-            continue
-        hist_len = max(1, _centroid_hist_len)
-        Xc = np.array([e["data"] for e in cbuf[-hist_len:]], dtype=float)
-        if centroid_project is not None:
-            ccoords = centroid_project(Xc)
-        else:
-            # Warmup fallback: use current display points for this class.
-            mask = labels == cls
-            if not mask.any():
-                continue
-            ccoords = coords[mask]
-        cmean = ccoords.mean(axis=0)
-        live_centroids[cls] = cmean
-
-    if (
-        _phase2_active
-        and _phase2_pending_freeze
-        and centroid_project is not None
-    ):
-        _phase2_frozen_proj = centroid_project
-        _phase2_frozen_centroids = {
-            cls: pos.copy() for cls, pos in live_centroids.items()
-        }
-        _phase2_pending_freeze = False
-
-    # User-triggered Phase 2 refit: rebuild frozen projection using all phase-2 data gathered so far.
-    if (
-        _phase2_active
-        and _phase2_refit_requested
-        and len(phase2_data_snap) >= 2
-    ):
-        X_all = np.array([e["data"] for e in phase2_data_snap], dtype=float)
-        y_all = np.array(
-            [
-                e["label"] if e["label"] is not None else -1
-                for e in phase2_data_snap
-            ],
-            dtype=int,
-        )
-        new_proj, method_name = _build_projection(_proj_mode, X_all, y_all)
-
-        if new_proj is not None:
-            _phase2_frozen_proj = new_proj
-            frozen_centroids: dict[int, np.ndarray] = {}
-            for cls in range(4):
-                cls_mask = y_all == cls
-                if cls_mask.any():
-                    ccoords = _phase2_frozen_proj(X_all[cls_mask])
-                    frozen_centroids[cls] = ccoords.mean(axis=0)
-            _phase2_frozen_centroids = frozen_centroids
-            centroid_project = _phase2_frozen_proj
-            _proj.method = f"{method_name} (P2 frozen)"
-            print(
-                f"Phase 2 refit applied using {len(phase2_data_snap)} gathered samples"
-            )
-
-        _phase2_refit_requested = False
-
     if _phase2_active and _phase2_frozen_centroids:
         for cls, cmean in _phase2_frozen_centroids.items():
             ax_proj.scatter(
@@ -1064,7 +1118,52 @@ def _update_inner():
         fontsize=8,
     )
 
-    fig.tight_layout(pad=2.5, rect=[0, 0.18, 1, 1])
+    # ----------------------------------------------------------------
+    # Right: centroid-distance softmax (same 2D coords + centroids as left)
+    # ----------------------------------------------------------------
+    ax_raw.cla()
+    ax_raw.set_facecolor("#141422")
+    for sp in ax_raw.spines.values():
+        sp.set_edgecolor("#333355")
+
+    n_pred = min(PRED_DISPLAY_LEN, N)
+    wcoords = coords[-n_pred:]
+    ridxs = idxs[-n_pred:]
+    rlabels = labels[-n_pred:]
+    probs = softmax_from_centroid_distances(wcoords, centroids_for_pred)
+
+    for i in range(len(ridxs) - 1):
+        lbl = rlabels[i]
+        if lbl >= 0:
+            ax_raw.axvspan(
+                ridxs[i],
+                ridxs[i + 1],
+                color=CLASS_COLORS[lbl],
+                alpha=0.06,
+                linewidth=0,
+            )
+
+    stack_colors = [CLASS_COLORS[c] for c in range(4)]
+    ax_raw.stackplot(
+        ridxs,
+        probs[:, 0],
+        probs[:, 1],
+        probs[:, 2],
+        probs[:, 3],
+        colors=stack_colors,
+        alpha=0.88,
+        linewidths=0,
+    )
+
+    ax_raw.set_ylim(0.0, 1.0)
+    ax_raw.set_title(
+        "Class prediction (softmax of −dist² to centroids)",
+        color="#aaa",
+        fontsize=11,
+    )
+    ax_raw.set_xlabel("sample index", color="#777", fontsize=9)
+    ax_raw.set_ylabel("stacked P(class)", color="#777", fontsize=9)
+    ax_raw.tick_params(colors="#888", labelsize=9)
 
 
 ani = animation.FuncAnimation(
@@ -1074,12 +1173,19 @@ ani = animation.FuncAnimation(
 print(
     f"Visualization running.  History: {HISTORY_LEN} samples  |  Refresh: {UPDATE_MS} ms"
 )
-print("Projection mode buttons added: LDA/PCA/QDA/KLDA/RF.")
+print(
+    "Keys (click the plot window first):  L = LDA projection   P = PCA projection   2 = Phase 2   R = P2 refit"
+)
 print(
     f"Centroid history slider range: 5..{CENTROID_HISTORY_MAX} (default {CENTROID_HISTORY_LEN})"
 )
 print(
     "Last-points overlay: button or H key (shows all labeled history in buffer)"
+)
+print(
+    "Save model: button or S key → .npz in cwd (macosx backend); "
+    "CLASSIC_MODEL_SAVE_PATH=/path/file.npz to set path; "
+    "CLASSIC_MODEL_SAVE_DIALOG=1 to try Tk file picker."
 )
 print("Close the window to quit.\n")
 
